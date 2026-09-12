@@ -1,15 +1,5 @@
 # ==========================================
 # 6. Bridge robustness analysis
-#
-# Purpose:
-# 1) examine whether source-model field predictions retain meaningful
-#    information before calibration;
-# 2) quantify shrinkage toward the field mean;
-# 3) report the linear bridge slope and its 95% CI;
-# 4) compare the bridge with a naive mean-prediction baseline;
-# 5) evaluate calibration stability using bootstrap resampling;
-# 6) compare Linear / Quadratic / GAM bridge errors on the same
-#    84 validation samples.
 # ==========================================
 
 # ----------------------------
@@ -38,8 +28,8 @@ RANDOM_SEED <- 42
 BOOT_B <- 1000
 JSD_BINS <- 30
 
-model_dir <- "C:/Users/田玲玲/Desktop"
-save_dir  <- "C:/Users/田玲玲/Desktop"
+model_dir <- "XXX"
+save_dir  <- "XXX"
 dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
 
 # ----------------------------
