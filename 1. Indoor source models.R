@@ -43,7 +43,7 @@ RF_NTREE <- 500
 RF_CV_FOLDS <- 5     # 随机森林调参采用5折交叉验证
 RF_TUNE_LENGTH <- 5  # 自动搜索5个候选mtry参数值
 
-save_dir <- "C:/Users/田玲玲/Desktop"
+save_dir <- "XXX"
 dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
 
 # ----------------------------
