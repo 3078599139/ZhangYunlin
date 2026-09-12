@@ -1,10 +1,5 @@
 # ==========================================
 # 7. Sample-size sensitivity analysis
-#
-# Purpose:
-# Compare Field-local modeling and Linear bridge calibration
-# under progressively smaller field calibration sample sizes.
-
 # ==========================================
 
 # ----------------------------
@@ -44,8 +39,8 @@ RF_NTREE <- 500
 RF_CV_FOLDS <- 5
 RF_TUNE_LENGTH <- 5
 
-model_dir <- "C:/Users/田玲玲/Desktop"
-save_dir  <- "C:/Users/田玲玲/Desktop"
+model_dir <- "XXX"
+save_dir  <- "XXX"
 dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
 
 # ----------------------------
