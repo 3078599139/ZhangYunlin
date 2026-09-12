@@ -1,316 +1,609 @@
-import cv2
-import numpy as np
-from pathlib import Path
-from skimage.feature import local_binary_pattern
-from sklearn.ensemble import RandomForestClassifier
-import joblib
-import warnings
-
-warnings.filterwarnings('ignore')
-
-# ============== 全局配置 ==============
-TARGET_SIZE = (1300, 1300)   # (宽, 高)
-CLAHE_CLIP = 3.0
-CLAHE_GRID = (8, 8)
-GAUSSIAN_KERNEL = (3, 3)
-GAUSSIAN_SIGMA = 0.5
-LBP_POINTS = 8
-LBP_RADIUS = 1
-LBP_METHOD = 'uniform'
-
-
-# ============== 预处理：与 1.1 保持完全一致 ==============
-def resize_and_pad(image, target_size=TARGET_SIZE):
-    """缩放并居中填充至目标尺寸，保持比例，不足部分用黑色填充。"""
-    h, w = image.shape[:2]
-    target_w, target_h = target_size
-
-    if h == 0 or w == 0:
-        raise ValueError("输入图像尺寸无效。")
-
-    scale = min(target_w / w, target_h / h)
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-
-    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-
-    x_offset = (target_w - new_w) // 2
-    y_offset = (target_h - new_h) // 2
-    canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
-    return canvas
-
-
-def clahe_lab(image, clip_limit=CLAHE_CLIP, tile_grid_size=CLAHE_GRID):
-    """LAB 空间 CLAHE 增强。"""
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
-    l_enhanced = clahe.apply(l)
-    lab_enhanced = cv2.merge([l_enhanced, a, b])
-    return cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
-
-
-def gaussian_blur(image, kernel=GAUSSIAN_KERNEL, sigma=GAUSSIAN_SIGMA):
-    """高斯模糊去噪。"""
-    return cv2.GaussianBlur(image, kernel, sigma)
-
-
-def preprocess_image(img_bgr):
-    """
-    输入 BGR 图像，输出：
-    1) 预处理后的 RGB 图
-    2) 预处理后的 LAB 图
-    3) Sobel 梯度幅值图
-    预处理流程与 1.1 完全一致：等比例缩放填充 -> CLAHE -> 高斯模糊
-    """
-    if img_bgr is None:
-        raise ValueError("输入图像为空。")
-
-    img_bgr = resize_and_pad(img_bgr)
-    img_bgr = clahe_lab(img_bgr)
-    img_bgr = gaussian_blur(img_bgr)
-
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    grad_mag = cv2.magnitude(grad_x, grad_y)
-    if grad_mag.max() > 0:
-        grad_mag = np.uint8(np.clip(grad_mag / grad_mag.max() * 255, 0, 255))
-    else:
-        grad_mag = np.zeros_like(gray, dtype=np.uint8)
-
-    return img_rgb, lab, grad_mag
-
-
-def extract_pixel_features(img_rgb, lab, grad_mag):
-    """提取 13 维像素特征。"""
-    h, w = img_rgb.shape[:2]
-
-    # 颜色特征
-    r, g, b = cv2.split(img_rgb)
-    l, a_lab, b_lab = cv2.split(lab)
-    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-    h_hsv, s_hsv, v_hsv = cv2.split(hsv)
-
-    # 纹理特征：逐像素 uniform-LBP 编码值
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    lbp = local_binary_pattern(gray, LBP_POINTS, LBP_RADIUS, method=LBP_METHOD)
-    lbp = np.uint8(np.clip(lbp * (255.0 / (LBP_POINTS + 1)), 0, 255))
-
-    # 空间坐标（归一化）
-    x_coords = np.tile(np.arange(w), (h, 1)).astype(np.float32) / w
-    y_coords = np.tile(np.arange(h).reshape(-1, 1), (1, w)).astype(np.float32) / h
-
-    features = np.dstack([
-        r, g, b,
-        l, a_lab, b_lab,
-        h_hsv, s_hsv, v_hsv,
-        grad_mag,
-        lbp,
-        x_coords, y_coords
-    ])
-    return features
-
-
-def mask_resize_and_pad(mask, target_size=TARGET_SIZE):
-    """对单通道掩码执行与图像一致的等比例缩放和黑边填充。"""
-    h, w = mask.shape[:2]
-    target_w, target_h = target_size
-
-    if h == 0 or w == 0:
-        raise ValueError("输入掩码尺寸无效。")
-
-    scale = min(target_w / w, target_h / h)
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-
-    resized = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-    canvas = np.zeros((target_h, target_w), dtype=np.uint8)
-
-    x_offset = (target_w - new_w) // 2
-    y_offset = (target_h - new_h) // 2
-    canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
-    return canvas
-
-
-def find_matching_pairs(image_dir, mask_dir, suffix="_mask", mask_ext=".png"):
-    """匹配原始图像与标注掩码（自动过滤无掩码的图片）。"""
-    image_dir = Path(image_dir)
-    mask_dir = Path(mask_dir)
-    image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
-    image_files = sorted(f for f in image_dir.iterdir() if f.suffix.lower() in image_exts)
-
-    img_paths, mask_paths = [], []
-    for img_file in image_files:
-        mask_name = f"{img_file.stem}{suffix}{mask_ext}"
-        mask_file = mask_dir / mask_name
-        if mask_file.exists():
-            img_paths.append(str(img_file))
-            mask_paths.append(str(mask_file))
-        else:
-            print(f"⚠️ 跳过 {img_file.name}：无对应掩码")
-    return img_paths, mask_paths
-
-
-def build_training_data(img_paths, mask_paths, sample_ratio=0.1, random_state=42):
-    """构建训练集（图像和掩码均统一为 TARGET_SIZE）。"""
-    rng = np.random.default_rng(random_state)
-    X_list, y_list = [], []
-
-    for img_path, mask_path in zip(img_paths, mask_paths):
-        print(f"处理训练样本：{Path(img_path).name}")
-
-        img_bgr = cv2.imread(img_path)
-        if img_bgr is None:
-            print(f"⚠️ 跳过 {img_path}：图像读取失败")
-            continue
-        img_rgb, lab, grad_mag = preprocess_image(img_bgr)
-        features = extract_pixel_features(img_rgb, lab, grad_mag)
-
-        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            print(f"⚠️ 跳过 {mask_path}：掩码读取失败")
-            continue
-        mask = mask_resize_and_pad(mask, target_size=TARGET_SIZE)
-        mask_bin = (mask > 127).astype(np.uint8).flatten()
-
-        feat_flat = features.reshape(-1, features.shape[-1])
-
-        n_pixels = len(mask_bin)
-        n_sample = max(1, int(n_pixels * sample_ratio))
-        indices = rng.choice(n_pixels, n_sample, replace=False)
-
-        X_list.append(feat_flat[indices])
-        y_list.append(mask_bin[indices])
-
-    if not X_list:
-        raise ValueError("未能成功构建训练数据，请检查图像和掩码。")
-
-    X = np.vstack(X_list)
-    y = np.hstack(y_list)
-    print(f"训练数据构建完成：X {X.shape}, y {y.shape}")
-    return X, y
-
-
-def train_segmentation_model(X, y, save_path="models/segmentation_rf.pkl"):
-    """训练随机森林分类器。"""
-    print("开始训练随机森林...")
-    clf = RandomForestClassifier(
-        n_estimators=100,
-        max_depth=15,
-        max_samples=0.7,
-        n_jobs=-1,
-        random_state=42,
-        class_weight={0: 1, 1: 2}
-    )
-    clf.fit(X, y)
-    print(f"训练完成，训练集准确率：{clf.score(X, y):.4f}")
-
-    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(clf, save_path)
-    print(f"模型已保存：{save_path}")
-    return clf
-
-
-def segment_image(img_bgr, classifier, threshold=0.85):
-    """使用概率阈值分割，返回二值掩码和预处理 RGB 图。"""
-    img_rgb, lab, grad_mag = preprocess_image(img_bgr)
-    features = extract_pixel_features(img_rgb, lab, grad_mag)
-    feat_flat = features.reshape(-1, features.shape[-1])
-    proba = classifier.predict_proba(feat_flat)[:, 1]
-    pred_mask = (proba > threshold).astype(np.uint8) * 255
-    pred_mask = pred_mask.reshape(features.shape[:2])
-    return pred_mask, img_rgb
-
-
-def refine_mask(mask, min_area=50, max_area=80000):
-    """形态学开闭运算并按连通域面积过滤。"""
-    if mask.ndim == 1:
-        mask = mask.reshape(TARGET_SIZE[1], TARGET_SIZE[0])
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    mask_filtered = np.zeros_like(mask)
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if min_area <= area <= max_area:
-            cv2.drawContours(mask_filtered, [cnt], -1, 255, thickness=cv2.FILLED)
-    return mask_filtered
-
-
-def batch_process(input_dir, output_dir, classifier, prob_threshold=0.85, min_area=50, max_area=80000):
-    """批量分割并保存掩码和叠加图。"""
-    input_dir = Path(input_dir)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
-    image_files = sorted(f for f in input_dir.iterdir() if f.suffix.lower() in image_exts)
-
-    for img_file in image_files:
-        print(f"处理：{img_file.name}")
-        img_bgr = cv2.imread(str(img_file))
-        if img_bgr is None:
-            print(f"⚠️ 跳过 {img_file.name}：图像读取失败")
-            continue
-
-        mask, img_rgb = segment_image(img_bgr, classifier, threshold=prob_threshold)
-        mask_refined = refine_mask(mask, min_area=min_area, max_area=max_area)
-
-        cv2.imwrite(str(output_dir / f"{img_file.stem}_mask.png"), mask_refined)
-
-        overlay = img_rgb.copy()
-        overlay[mask_refined > 0] = (0, 255, 0)
-        overlay_img = cv2.addWeighted(img_rgb, 0.7, overlay, 0.3, 0)
-        cv2.imwrite(
-            str(output_dir / f"{img_file.stem}_overlay.jpg"),
-            cv2.cvtColor(overlay_img, cv2.COLOR_RGB2BGR)
-        )
-        print("   ✓ 已保存掩码和叠加图")
-
-    print(f"批量处理完成，结果保存在：{output_dir}")
-
-
-if __name__ == "__main__":
-    ORIGIN_DIR = "0-Indoor_origin"
-    LABEL_DIR = "1-Indoor_labels"
-    OUTPUT_DIR = "2-Indoor_Segmentation"
-    MODEL_PATH = "segmentation_rf.pkl"
-
-    print("=" * 60)
-    print("针叶分割系统（等比例缩放填充 + CLAHE + 高斯去噪）")
-    print("说明：输入图像已在前期完成人工边框裁剪")
-    print("=" * 60)
-
-    img_paths, mask_paths = find_matching_pairs(
-        image_dir=ORIGIN_DIR,
-        mask_dir=LABEL_DIR,
-        suffix="_mask",
-        mask_ext=".png"
-    )
-    if len(img_paths) == 0:
-        raise FileNotFoundError("未找到任何标注数据！请检查掩码命名规则。")
-    print(f"✅ 找到 {len(img_paths)} 张标注图像。")
-
-    X_train, y_train = build_training_data(img_paths, mask_paths, sample_ratio=0.1, random_state=42)
-    clf = train_segmentation_model(X_train, y_train, save_path=MODEL_PATH)
-
-    batch_process(
-        ORIGIN_DIR,
-        OUTPUT_DIR,
-        clf,
-        prob_threshold=0.85,
-        min_area=50,
-        max_area=80000
+# ==========================================
+# 1. Indoor source models
+# Models: MLR / RF
+# Added: R2, JSD, MLR diagnostics, explicit RF ntree,
+#        5-fold CV tuning for mtry, OOB diagnostics
+# ==========================================
+
+# ----------------------------
+# 0. Packages
+# ----------------------------
+required_packages <- c(
+  "readxl", "dplyr", "car", "caret", "randomForest",
+  "ggplot2", "MASS", "patchwork", "lmtest"
+)
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+library(readxl)
+library(dplyr)
+library(car)
+library(caret)
+library(randomForest)
+library(ggplot2)
+library(MASS)
+library(patchwork)
+library(lmtest)
+
+# ----------------------------
+# 1. Global settings
+# ----------------------------
+response_var <- "y"
+RANDOM_SEED <- 42    # 随机种子编号
+JSD_BINS <- 30       # JSD计算时，将连续特征分成30个区间
+
+# RF settings:
+# mtry is optimized by 5-fold cross-validation.
+# ntree is fixed explicitly.
+RF_NTREE <- 500
+RF_CV_FOLDS <- 5     # 随机森林调参采用5折交叉验证
+RF_TUNE_LENGTH <- 5  # 自动搜索5个候选mtry参数值
+
+save_dir <- "C:/Users/田玲玲/Desktop"
+dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ----------------------------
+# 2. Read data
+# ----------------------------
+# Select in order:
+# 1) indoor_train.xlsx (expected n = 84)
+# 2) indoor_test.xlsx  (expected n = 36)
+train <- read_excel(file.choose())
+test  <- read_excel(file.choose())
+
+train <- as.data.frame(train)
+test  <- as.data.frame(test)
+
+if (nrow(train) != 84) {
+  warning(paste0("Indoor training set has ", nrow(train), " samples; expected 84."))
+}
+if (nrow(test) != 36) {
+  warning(paste0("Indoor testing set has ", nrow(test), " samples; expected 36."))
+}
+
+# ----------------------------
+# 3. Prepare data
+# ----------------------------
+prepare_data <- function(df) {
+  df[] <- lapply(df, function(x) as.numeric(as.character(x)))
+  na.omit(df)
+}
+
+train <- prepare_data(train)
+test  <- prepare_data(test)
+
+required_cols <- names(train)
+missing_cols <- setdiff(required_cols, names(test))
+if (length(missing_cols) > 0) {
+  stop(paste("测试集缺少以下列：", paste(missing_cols, collapse = ", ")))
+}
+test <- test[, required_cols]
+
+feature_vars_all <- setdiff(names(train), response_var)    # 获取train数据框中的列名，把y去掉，剩下为预测变量。
+
+cat("Indoor training samples:", nrow(train), "\n")    # 统计训练集train有多少行
+cat("Indoor testing samples :", nrow(test), "\n")     # 统计测试test的样本数量
+cat("Number of predictors   :", length(feature_vars_all), "\n")   # 统计预测变量
+
+# ----------------------------
+# 4. Utility functions
+# ----------------------------
+# Jensen-Shannon divergence between observed and predicted distributions.
+# The two distributions are discretized using 30 equal-width bins over
+# their shared range. log2 is used, so JSD theoretically ranges from 0 to 1.
+# JSD is treated as a supplementary distributional metric.
+calc_jsd <- function(obs, pred, n_bins = JSD_BINS, eps = 1e-12) {
+  obs <- as.numeric(obs)
+  pred <- as.numeric(pred)
+
+  keep <- is.finite(obs) & is.finite(pred)
+  obs <- obs[keep]
+  pred <- pred[keep]
+
+  if (length(obs) < 2 || length(pred) < 2) return(NA_real_)
+
+  rng <- range(c(obs, pred), na.rm = TRUE)
+  if (!all(is.finite(rng))) return(NA_real_)
+  if (diff(rng) == 0) return(0)
+
+  breaks <- seq(rng[1], rng[2], length.out = n_bins + 1)
+
+  p <- hist(obs, breaks = breaks, plot = FALSE, include.lowest = TRUE)$counts + eps
+  q <- hist(pred, breaks = breaks, plot = FALSE, include.lowest = TRUE)$counts + eps
+
+  p <- p / sum(p)
+  q <- q / sum(q)
+  m <- 0.5 * (p + q)
+
+  jsd <- 0.5 * sum(p * log2(p / m)) +
+         0.5 * sum(q * log2(q / m))
+
+  as.numeric(jsd)
+}
+
+calc_metrics <- function(obs, pred) {
+  obs <- as.numeric(obs)
+  pred <- as.numeric(pred)
+
+  keep <- is.finite(obs) & is.finite(pred)
+  obs <- obs[keep]
+  pred <- pred[keep]
+
+  r2   <- 1 - sum((obs - pred)^2) / sum((obs - mean(obs))^2)
+  rmse <- sqrt(mean((obs - pred)^2))
+  mae  <- mean(abs(obs - pred))
+
+  nonzero <- obs != 0
+  mre <- if (any(nonzero)) {
+    mean(abs((obs[nonzero] - pred[nonzero]) / obs[nonzero])) * 100
+  } else {
+    NA_real_
+  }
+
+  jsd <- calc_jsd(obs, pred)
+
+  data.frame(
+    R2 = r2,
+    RMSE = rmse,
+    MAE = mae,
+    MRE = mre,
+    JSD = jsd
+  )
+}
+
+padded_range <- function(x, pad_ratio = 0.05) {
+  rng <- range(x, na.rm = TRUE)
+  span <- diff(rng)
+
+  if (!is.finite(span) || span == 0) {
+    span <- max(abs(rng), na.rm = TRUE)
+    if (!is.finite(span) || span == 0) span <- 1
+  }
+
+  pad <- span * pad_ratio
+  c(rng[1] - pad, rng[2] + pad)
+}
+
+calc_point_density <- function(x, y, n = 120) {
+  x <- as.numeric(x)
+  y <- as.numeric(y)
+
+  xlim <- padded_range(x)
+  ylim <- padded_range(y)
+
+  dens <- MASS::kde2d(
+    x, y,
+    n = n,
+    lims = c(xlim, ylim)
+  )
+
+  ix <- findInterval(x, dens$x, all.inside = TRUE)
+  iy <- findInterval(y, dens$y, all.inside = TRUE)
+
+  ix <- pmax(1, pmin(ix, length(dens$x)))
+  iy <- pmax(1, pmin(iy, length(dens$y)))
+
+  as.numeric(dens$z[cbind(ix, iy)])
+}
+
+save_jsd_density_plot <- function(obs, pred, metrics, title_text, file_path) {
+  obs <- as.numeric(obs)
+  pred <- as.numeric(pred)
+
+  keep <- is.finite(obs) & is.finite(pred)
+  obs <- obs[keep]
+  pred <- pred[keep]
+
+  df <- data.frame(
+    observed = obs,
+    predicted = pred
+  )
+  df$density <- calc_point_density(df$observed, df$predicted)
+
+  axis_lim <- padded_range(c(obs, pred))
+
+  metrics_text <- paste0(
+    "R² = ", sprintf("%.3f", metrics$R2), "\n",
+    "RMSE = ", sprintf("%.3f", metrics$RMSE), "\n",
+    "MAE = ", sprintf("%.3f", metrics$MAE), "\n",
+    "MRE = ", sprintf("%.2f", metrics$MRE), "%\n",
+    "JSD = ", sprintf("%.3f", metrics$JSD)
+  )
+
+  p_scatter <- ggplot(df, aes(x = observed, y = predicted)) +
+    geom_point(aes(color = density), size = 2.4, alpha = 0.85) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.7) +
+    annotate(
+      "label",
+      x = axis_lim[1],
+      y = axis_lim[2],
+      label = metrics_text,
+      hjust = 0,
+      vjust = 1,
+      size = 3.6,
+      label.size = 0.2,
+      fill = "white",
+      alpha = 0.85
+    ) +
+    labs(
+      title = title_text,
+      x = "Observed load",
+      y = "Predicted load",
+      color = "Point density"
+    ) +
+    coord_equal(xlim = axis_lim, ylim = axis_lim) +
+    theme_bw(base_size = 12)
+
+  dist_df <- rbind(
+    data.frame(value = obs, Distribution = "Observed"),
+    data.frame(value = pred, Distribution = "Predicted")
+  )
+
+  p_density <- ggplot(
+    dist_df,
+    aes(x = value, color = Distribution, fill = Distribution)
+  ) +
+    geom_density(alpha = 0.22, linewidth = 0.8) +
+    annotate(
+      "text",
+      x = axis_lim[1],
+      y = Inf,
+      label = paste0(
+        "JSD = ", sprintf("%.3f", metrics$JSD),
+        "  (0 = identical distributions)"
+      ),
+      hjust = 0,
+      vjust = 1.3,
+      size = 3.8
+    ) +
+    labs(
+      x = "Load",
+      y = "Density"
+    ) +
+    scale_x_continuous(limits = axis_lim) +
+    theme_bw(base_size = 12) +
+    theme(
+      legend.position = "top",
+      legend.title = element_blank()
     )
 
-    print("\n✨ 全部流程执行完毕！")
-    print(f"   - 分割结果：{OUTPUT_DIR}")
-    print(f"   - 训练模型：{MODEL_PATH}")
+  p_combined <- p_scatter / p_density +
+    patchwork::plot_layout(heights = c(3.1, 1.15))
+
+  ggsave(
+    file_path,
+    p_combined,
+    width = 6.2,
+    height = 7.2,
+    dpi = 300
+  )
+}
+
+# ----------------------------
+# 5. MLR model
+# ----------------------------
+# Variable-selection procedure:
+# 1) remove completely aliased predictors;
+# 2) iteratively remove the predictor with the largest VIF until all VIF < 10;
+# 3) perform bidirectional AIC stepwise selection.
+fit_mlr <- function(train_df, response_var = "y") {
+  feature_vars <- setdiff(names(train_df), response_var)
+
+  full_formula <- as.formula(
+    paste(response_var, "~", paste(feature_vars, collapse = " + "))
+  )
+
+  full_model_alias <- lm(full_formula, data = train_df)
+
+  aliased <- alias(full_model_alias)$Complete
+  if (!is.null(aliased)) {
+    aliased_vars <- rownames(aliased)
+    feature_vars <- setdiff(feature_vars, aliased_vars)
+  }
+
+  repeat {
+    vif_formula <- as.formula(
+      paste(response_var, "~", paste(feature_vars, collapse = " + "))
+    )
+
+    vif_model <- lm(vif_formula, data = train_df)
+    vif_vals <- car::vif(vif_model)
+
+    if (max(vif_vals) < 10) break
+
+    remove_var <- names(which.max(vif_vals))
+    feature_vars <- setdiff(feature_vars, remove_var)
+
+    if (length(feature_vars) <= 1) break
+  }
+
+  upper_formula <- as.formula(
+    paste(response_var, "~", paste(feature_vars, collapse = " + "))
+  )
+  lower_formula <- as.formula(paste(response_var, "~ 1"))
+
+  upper_model <- lm(upper_formula, data = train_df)
+  lower_model <- lm(lower_formula, data = train_df)
+
+  step(
+    lower_model,
+    scope = list(
+      lower = lower_formula,
+      upper = formula(upper_model)
+    ),
+    direction = "both",
+    trace = 0
+  )
+}
+
+mlr_model <- fit_mlr(train, response_var)
+
+mlr_pred_train <- predict(mlr_model, newdata = train)
+mlr_pred_test  <- predict(mlr_model, newdata = test)
+
+mlr_metrics <- bind_rows(
+  cbind(
+    Model = "MLR",
+    Dataset = "Train",
+    calc_metrics(train$y, mlr_pred_train)
+  ),
+  cbind(
+    Model = "MLR",
+    Dataset = "Test",
+    calc_metrics(test$y, mlr_pred_test)
+  )
+)
+
+mlr_coef_df <- data.frame(
+  Feature = rownames(summary(mlr_model)$coefficients),
+  summary(mlr_model)$coefficients,
+  row.names = NULL
+)
+
+colnames(mlr_coef_df) <- c(
+  "Feature", "Estimate", "Std_Error", "t_value", "P_value"
+)
+
+# MLR residual diagnostics.
+# Independence is primarily addressed by the sampling design; therefore,
+# no sequence-based Durbin-Watson test is used here.
+resid_values <- residuals(mlr_model)
+
+shapiro_result <- if (length(resid_values) >= 3 && length(resid_values) <= 5000) {
+  shapiro.test(resid_values)
+} else {
+  NULL
+}
+
+bp_result <- lmtest::bptest(mlr_model)
+
+mlr_diagnostic_stats <- data.frame(
+  Diagnostic = c(
+    "Shapiro-Wilk residual normality",
+    "Breusch-Pagan homoscedasticity"
+  ),
+  Statistic = c(
+    ifelse(is.null(shapiro_result), NA, unname(shapiro_result$statistic)),
+    unname(bp_result$statistic)
+  ),
+  P_value = c(
+    ifelse(is.null(shapiro_result), NA, shapiro_result$p.value),
+    bp_result$p.value
+  )
+)
+
+pdf(
+  file.path(save_dir, "Indoor_MLR_residual_diagnostics.pdf"),
+  width = 8,
+  height = 8
+)
+par(mfrow = c(2, 2))
+plot(mlr_model)
+dev.off()
+
+# ----------------------------
+# 6. RF model
+# ----------------------------
+# mtry is selected using 5-fold cross-validation.
+# ntree is fixed explicitly at RF_NTREE (= 500).
+set.seed(RANDOM_SEED)
+
+rf_control <- trainControl(
+  method = "cv",
+  number = RF_CV_FOLDS
+)
+
+rf_tune <- train(
+  x = train[, feature_vars_all, drop = FALSE],
+  y = train[[response_var]],
+  method = "rf",
+  tuneLength = RF_TUNE_LENGTH,
+  ntree = RF_NTREE,
+  importance = TRUE,
+  trControl = rf_control
+)
+
+rf_model <- rf_tune
+
+rf_pred_train <- predict(
+  rf_model,
+  newdata = train[, feature_vars_all, drop = FALSE]
+)
+
+rf_pred_test <- predict(
+  rf_model,
+  newdata = test[, feature_vars_all, drop = FALSE]
+)
+
+rf_metrics <- bind_rows(
+  cbind(
+    Model = "RF",
+    Dataset = "Train",
+    calc_metrics(train$y, rf_pred_train)
+  ),
+  cbind(
+    Model = "RF",
+    Dataset = "Test",
+    calc_metrics(test$y, rf_pred_test)
+  )
+)
+
+rf_param_df <- data.frame(
+  mtry = rf_tune$bestTune$mtry,
+  ntree = RF_NTREE,
+  CV_folds = RF_CV_FOLDS
+)
+
+# Save all mtry candidates and their cross-validation performance.
+rf_cv_results <- rf_tune$results
+
+# OOB error is reported as a diagnostic of the fitted RF;
+# it is not used here to claim that ntree was optimized.
+rf_oob_df <- data.frame(
+  Tree = seq_along(rf_tune$finalModel$mse),
+  OOB_MSE = rf_tune$finalModel$mse,
+  OOB_RMSE = sqrt(rf_tune$finalModel$mse)
+)
+
+p_oob <- ggplot(
+  rf_oob_df,
+  aes(x = Tree, y = OOB_RMSE)
+) +
+  geom_line(linewidth = 0.7) +
+  labs(
+    title = "Indoor RF: OOB error by number of trees",
+    x = "Number of trees",
+    y = "OOB RMSE"
+  ) +
+  theme_bw()
+
+ggsave(
+  file.path(save_dir, "Indoor_RF_OOB_error_curve.pdf"),
+  p_oob,
+  width = 6,
+  height = 4.5,
+  dpi = 300
+)
+
+rf_importance <- as.data.frame(varImp(rf_tune)$importance)
+rf_importance$Feature <- rownames(rf_importance)
+rownames(rf_importance) <- NULL
+
+# ----------------------------
+# 7. Save outputs
+# ----------------------------
+all_metrics <- bind_rows(
+  mlr_metrics,
+  rf_metrics
+)
+
+write.csv(
+  all_metrics,
+  file.path(save_dir, "Indoor_source_metrics.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  mlr_coef_df,
+  file.path(save_dir, "Indoor_MLR_coefficients.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  mlr_diagnostic_stats,
+  file.path(save_dir, "Indoor_MLR_diagnostics.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  rf_param_df,
+  file.path(save_dir, "Indoor_RF_best_params.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  rf_cv_results,
+  file.path(save_dir, "Indoor_RF_CV_tuning_results.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  rf_oob_df,
+  file.path(save_dir, "Indoor_RF_OOB_error.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  rf_importance,
+  file.path(save_dir, "Indoor_RF_variable_importance.csv"),
+  row.names = FALSE
+)
+
+pred_df <- bind_rows(
+  data.frame(
+    Model = "MLR",
+    Dataset = "Train",
+    observed = train$y,
+    predicted = mlr_pred_train
+  ),
+  data.frame(
+    Model = "MLR",
+    Dataset = "Test",
+    observed = test$y,
+    predicted = mlr_pred_test
+  ),
+  data.frame(
+    Model = "RF",
+    Dataset = "Train",
+    observed = train$y,
+    predicted = rf_pred_train
+  ),
+  data.frame(
+    Model = "RF",
+    Dataset = "Test",
+    observed = test$y,
+    predicted = rf_pred_test
+  )
+)
+
+write.csv(
+  pred_df,
+  file.path(save_dir, "Indoor_source_predictions.csv"),
+  row.names = FALSE
+)
+
+saveRDS(
+  mlr_model,
+  file.path(save_dir, "MLR_model.rds")
+)
+
+saveRDS(
+  rf_model,
+  file.path(save_dir, "RF_model.rds")
+)
+
+save_jsd_density_plot(
+  test$y,
+  mlr_pred_test,
+  calc_metrics(test$y, mlr_pred_test),
+  "Indoor source: MLR",
+  file.path(save_dir, "Indoor_MLR_test_JSD_density.pdf")
+)
+
+save_jsd_density_plot(
+  test$y,
+  rf_pred_test,
+  calc_metrics(test$y, rf_pred_test),
+  "Indoor source: RF",
+  file.path(save_dir, "Indoor_RF_test_JSD_density.pdf")
+)
+
+print(all_metrics)
+cat("\nIndoor RF selected mtry =", rf_tune$bestTune$mtry, "\n")
+cat("Indoor RF fixed ntree   =", RF_NTREE, "\n")
+cat("\n结果已保存至：", save_dir, "\n")
