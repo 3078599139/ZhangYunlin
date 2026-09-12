@@ -1,12 +1,5 @@
 # ==========================================
 # 5. Feature shift analysis
-#
-# Purpose:
-# 1) quantify indoor-field feature shift for all 34 predictors;
-# 2) define the "Std. Shift" used in the manuscript;
-# 3) test indoor-field feature differences with FDR correction;
-# 4) compare feature-load relationships between domains.
-
 # ==========================================
 
 # ----------------------------
@@ -32,7 +25,7 @@ library(tidyr)
 # ----------------------------
 response_var <- "y"
 
-save_dir <- "C:/Users/田玲玲/Desktop"
+save_dir <- "XXX"
 dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
 
 # ----------------------------
